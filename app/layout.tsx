@@ -33,7 +33,7 @@ export const metadata: Metadata = {
     template: "%s · 한비의 코드 서랍",
   },
   description:
-    "대용량 데이터를 다루는 백엔드 개발자 유한비가 코드를 고치며 배운 것들을 정리해두는 서랍입니다.",
+    "대용량 데이터를 다루면서 배운 것들을 정리해두는 공간입니다.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
