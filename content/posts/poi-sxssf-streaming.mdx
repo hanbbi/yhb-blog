@@ -1,0 +1,70 @@
+---
+title: "5만 건 엑셀 다운로드에서 OutOfMemory가 난 이유"
+date: "2026-05-02"
+summary: "XSSFWorkbook은 시트 전체를 메모리에 올려둔다. SXSSF 스트리밍으로 바꾸며 알게 된 것들."
+tags: ["Java", "성능튜닝"]
+---
+
+아파트 단지 검침 데이터를 엑셀로 내려받는 기능이었다. 개발할 때는 잘 됐는데, 실제 단지 데이터로 테스트하니 서버가 죽었다.
+
+## 재현: 5만 건이 넘어가면 죽는다
+
+처음 짠 코드는 흔히 보는 형태였다.
+
+```java
+Workbook workbook = new XSSFWorkbook();
+Sheet sheet = workbook.createSheet("검침 내역");
+
+int rowIdx = 0;
+for (Reading reading : readings) { // 5만 건 이상
+    Row row = sheet.createRow(rowIdx++);
+    row.createCell(0).setCellValue(reading.getDeviceId());
+    row.createCell(1).setCellValue(reading.getUsageValue());
+    row.createCell(2).setCellValue(reading.getMeasuredAt().toString());
+}
+workbook.write(response.getOutputStream());
+```
+
+`XSSFWorkbook`은 셀 하나하나를 메모리 위의 객체 트리로 들고 있는다. 데이터가 몇천 건일 땐 몰랐는데, 5만 건이 넘어가니 힙이 순식간에 찼다. `OutOfMemoryError`가 터진 다음에야 이 방식의 한계를 체감했다.
+
+## 처방: SXSSFWorkbook으로 스트리밍
+
+Apache POI에는 이 문제를 위한 `SXSSFWorkbook`이 따로 있다. 지정한 행 수만큼만 메모리에 들고, 그 이상은 임시 파일에 흘려보낸(flush) 뒤 디스크에서 스트리밍한다.
+
+```java
+try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) { // 메모리에 100행만 유지
+    Sheet sheet = workbook.createSheet("검침 내역");
+
+    int rowIdx = 0;
+    for (Reading reading : readings) {
+        Row row = sheet.createRow(rowIdx++);
+        row.createCell(0).setCellValue(reading.getDeviceId());
+        row.createCell(1).setCellValue(reading.getUsageValue());
+        row.createCell(2).setCellValue(reading.getMeasuredAt().toString());
+    }
+
+    response.setContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    response.setHeader("Content-Disposition", "attachment; filename=readings.xlsx");
+    workbook.write(response.getOutputStream());
+} finally {
+    // SXSSFWorkbook은 임시 파일을 남기므로 반드시 정리한다
+}
+```
+
+생성자에 넘긴 `100`이 메모리에 유지할 행 수다. 101번째 행이 들어오는 순간, 가장 오래된 행부터 임시 파일로 flush되고 메모리에서 사라진다.
+
+> `SXSSFWorkbook`을 쓸 때 자주 놓치는 게 임시 파일 정리다. `workbook.dispose()`를 호출하지 않으면 임시 디렉터리에 파일이 계속 쌓인다. try-with-resources로 감싸두면 마음이 편하다.
+
+## 한 가지 트레이드오프
+
+스트리밍 방식이라 이미 flush된 행은 다시 읽거나 수정할 수 없다. 나처럼 위에서 아래로 한 번만 쓰고 끝나는 경우엔 문제가 안 되지만, 요약 행을 맨 위에 나중에 끼워 넣는 식의 로직이 있다면 순서를 미리 설계해둬야 한다.
+
+## 결과
+
+5만 건 넘는 데이터도 메모리 사용량이 거의 평평한 그래프를 그리며 다운로드가 끝났다. 힙 덤프를 다시 뜰 일이 없어졌다는 것만으로도 충분히 만족스러웠다.
+
+## 오늘의 배움
+
+- `XSSFWorkbook`은 전체 시트를 메모리에 들고 있는다. 대량 데이터에는 애초에 맞지 않는 선택이다.
+- `SXSSFWorkbook`은 지정한 행 수만 메모리에 유지하고 나머지는 디스크로 흘려보낸다.
+- 스트리밍 방식은 이미 흘려보낸 행을 다시 만질 수 없다는 제약이 있다는 걸 기억해두자.

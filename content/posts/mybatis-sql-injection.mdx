@@ -1,0 +1,65 @@
+---
+title: "MyBatis ${} 를 #{} 로 바꾸며 정리한 SQL Injection 체크리스트"
+date: "2026-06-05"
+summary: "코드 리뷰에서 지적받고 나서야 문자열 결합의 위험을 체감했다. 파라미터 바인딩으로 바꾼 과정과 함께 챙긴 접근 제어."
+tags: ["보안", "MyBatis"]
+---
+
+보안 점검 코드 리뷰에서 받은 코멘트 한 줄이 시작이었다. "이 부분, `${}` 쓰신 이유가 있나요?" 이유는 없었다. 그냥 예전 코드를 복사해서 썼을 뿐이었다.
+
+## 문제가 된 코드
+
+정렬 기준을 파라미터로 받는 흔한 목록 조회 쿼리였다.
+
+```xml
+<select id="findDevices" resultType="Device">
+  SELECT * FROM devices
+  WHERE site_id = #{siteId}
+  ORDER BY ${sortColumn} ${sortDirection}
+</select>
+```
+
+`siteId`는 `#{}`로 잘 바인딩했으면서, 정렬 컬럼과 방향은 `${}`로 문자열을 그대로 꽂아넣고 있었다. `${}`는 값을 이스케이프 없이 SQL 문자열에 직접 삽입하기 때문에, `sortColumn`에 `id; DROP TABLE devices;--` 같은 값이 들어오면 그대로 실행돼버린다.
+
+## 왜 정렬 컬럼은 `#{}`로 못 바꾸나
+
+이게 처음엔 헷갈렸다. `#{}`는 값을 `?` 플레이스홀더로 바인딩하기 때문에, **컬럼명이나 테이블명 같은 SQL 구조 자체**에는 쓸 수 없다. `ORDER BY #{sortColumn}`으로 바꾸면 `ORDER BY 'measured_at'`처럼 문자열 리터럴로 취급돼서 원하는 정렬이 되지 않는다.
+
+그래서 택한 방법은 **화이트리스트 검증**이었다.
+
+```java
+private static final Set<String> ALLOWED_SORT_COLUMNS =
+    Set.of("device_id", "measured_at", "usage_value");
+
+public List<Device> findDevices(String siteId, String sortColumn, String sortDirection) {
+    String safeColumn = ALLOWED_SORT_COLUMNS.contains(sortColumn) ? sortColumn : "measured_at";
+    String safeDirection = "DESC".equalsIgnoreCase(sortDirection) ? "DESC" : "ASC";
+    return deviceMapper.findDevices(siteId, safeColumn, safeDirection);
+}
+```
+
+값이 들어갈 자리는 `#{}`로, 구조를 결정하는 자리는 화이트리스트를 통과한 값만 `${}`로 넣는 것으로 정리했다.
+
+## 접근 제어도 같이 손봤다
+
+파라미터 바인딩만으로는 부족하다고 생각해서, 관리자 API 앞단에 `HandlerInterceptor`를 붙였다.
+
+```java
+@Override
+public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+    String clientIp = request.getRemoteAddr();
+    if (blacklistService.isBlocked(clientIp)) {
+        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        return false;
+    }
+    return true;
+}
+```
+
+IP 블랙리스트에 걸린 요청은 컨트롤러까지 가지도 못하고 여기서 끊어낸다. 쿼리 레벨의 방어와 요청 레벨의 방어를 따로 두니 마음이 한결 편해졌다.
+
+## 오늘의 배움
+
+- `${}`는 문자열 그대로 SQL에 삽입된다. 값은 무조건 `#{}`, 컬럼·테이블명처럼 구조를 바꾸는 부분만 화이트리스트 검증 후 `${}`.
+- 코드 리뷰에서 "왜 이렇게 쓰셨어요?"라는 질문에 답을 못 하면, 그 코드는 다시 봐야 할 코드다.
+- 파라미터 바인딩과 접근 제어는 서로 다른 레이어의 방어선이라 둘 다 챙기는 게 맞다.
